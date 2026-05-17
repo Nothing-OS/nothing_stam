@@ -1,33 +1,153 @@
-name: Create a Release
+name: PR Comment Release
+
 on:
-  push:
-    tags:
-    - 'v*'
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: write
+
 jobs:
   release:
-    name: Create a new Release
+    name: Release from PR comment
     runs-on: ubuntu-latest
+
+    if: github.event.issue.pull_request
+
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-    - name: Set output
-      id: vars
-      run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
-    - name: Copy files
-      run: |
-        mkdir -p ${{ github.event.repository.name }}
-        shopt -s extglob
-        rm -rf .git* LICENSE README.md .tekton
-        sed -i '0,/main/s/main/${{steps.vars.outputs.tag }}/' fxmanifest.lua
-        mv !(${{ github.event.repository.name }}) ${{ github.event.repository.name }}/
-    - uses: thedoctor0/zip-release@master
-      with:
-        type: 'zip'
-        filename: '${{ github.event.repository.name }}.zip'
-    - uses: marvinpinto/action-automatic-releases@v1.2.1
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        files: ${{ github.event.repository.name }}.zip
-        title: ${{ steps.vars.outputs.tag }}
-        prerelease: false
+      - name: Validate release request
+        id: request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body.trim();
+
+            const releaseMatch = body.match(/^trigger release\s+(v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/i);
+
+            if (!releaseMatch) {
+              core.info("No release command found. Use: trigger release v1.0.1");
+              core.setOutput("run_release", "false");
+              return;
+            }
+
+            const tag = releaseMatch[1];
+            const version = tag.replace(/^v/i, "");
+
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.issue.number;
+            const username = context.payload.comment.user.login;
+
+            const permission = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username
+            });
+
+            const allowedPermissions = ["admin", "maintain", "write"];
+
+            if (!allowedPermissions.includes(permission.data.permission)) {
+              core.setFailed(`${username} does not have permission to create releases.`);
+              return;
+            }
+
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber
+            });
+
+            if (!pr.data.merged) {
+              core.setFailed("This PR is not merged yet. Merge it before creating a release.");
+              return;
+            }
+
+            const targetSha = pr.data.merge_commit_sha || pr.data.head.sha;
+
+            core.setOutput("run_release", "true");
+            core.setOutput("tag", tag);
+            core.setOutput("version", version);
+            core.setOutput("target_sha", targetSha);
+            core.setOutput("resource", "nothing_stam");
+
+      - name: Checkout merged PR commit
+        if: steps.request.outputs.run_release == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.request.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Check release does not already exist
+        if: steps.request.outputs.run_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.request.outputs.tag }}"
+
+          git fetch --tags --force
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists."
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 1
+          fi
+
+      - name: Build FiveM resource zip
+        if: steps.request.outputs.run_release == 'true'
+        shell: bash
+        run: |
+          TAG="${{ steps.request.outputs.tag }}"
+          VERSION="${{ steps.request.outputs.version }}"
+          RESOURCE="${{ steps.request.outputs.resource }}"
+
+          mkdir -p "release/$RESOURCE"
+
+          rsync -av \
+            --exclude=".git" \
+            --exclude=".github" \
+            --exclude=".gitignore" \
+            --exclude=".tekton" \
+            --exclude="release" \
+            ./ "release/$RESOURCE/"
+
+          if [ -f "release/$RESOURCE/fxmanifest.lua" ]; then
+            sed -i -E "s/version[[:space:]]+['\"][^'\"]*['\"]/version '$VERSION'/" "release/$RESOURCE/fxmanifest.lua"
+          fi
+
+          cd release
+          zip -r "$RESOURCE.zip" "$RESOURCE"
+
+      - name: Create GitHub Release
+        if: steps.request.outputs.run_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.request.outputs.tag }}"
+          RESOURCE="${{ steps.request.outputs.resource }}"
+          TARGET_SHA="${{ steps.request.outputs.target_sha }}"
+          PR_NUMBER="${{ github.event.issue.number }}"
+
+          gh release create "$TAG" "release/$RESOURCE.zip" \
+            --target "$TARGET_SHA" \
+            --title "$TAG" \
+            --notes "Release for $RESOURCE from PR #$PR_NUMBER."
+
+      - name: Comment release result
+        if: steps.request.outputs.run_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.request.outputs.tag }}"
+          RESOURCE="${{ steps.request.outputs.resource }}"
+          PR_NUMBER="${{ github.event.issue.number }}"
+
+          gh issue comment "$PR_NUMBER" --body "✅ Release $TAG created with $RESOURCE.zip"
