@@ -1,6 +1,5 @@
 -- QBCore Client-side Unlimited Oxygen + Stamina using protected GlobalState
 -- author 'QBStevie'
-
 local unlimitedStam = false
 local stamThreadRunning = false
 
